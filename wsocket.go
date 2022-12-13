@@ -1,4 +1,4 @@
-package wsmqtt
+package wsocket
 
 import (
 	"context"
@@ -56,21 +56,11 @@ func (c *Client) Connect() error {
 	c.msg = &messenger{
 		ws: *conn,
 	}
-
 	rxtx := c.rxtx()
-	rxtx.OnTxError = func(tx *mqtt.Tx, err error) {
-		c.erraticDisconnect(err)
-	}
+	// Setup Rx.
 	rxtx.OnRxError = func(r *mqtt.Rx, err error) {
-		c.erraticDisconnect(err)
+		c.abnormalDisconnect(err)
 	}
-	rxtx.OnSuccessfulTx = func(tx *mqtt.Tx) {
-		err := c.msg.Send()
-		if err != nil {
-			log.Println("bug in OnSuccesfulTx:", err)
-		}
-	}
-
 	mt, rd, err := conn.Reader(ctx)
 	if err != nil {
 		return err
@@ -80,8 +70,22 @@ func (c *Client) Connect() error {
 	}
 	rxtx.SetRxTransport(io.NopCloser(rd))
 
+	// Setup Tx.
+	rxtx.OnTxError = func(tx *mqtt.Tx, err error) {
+		c.abnormalDisconnect(err)
+	}
+	rxtx.OnSuccessfulTx = func(tx *mqtt.Tx) {
+		// Websocket Writers accumulate writes until Close is called.
+		// After Close called the writer flushes contents onto the network.
+		// This means we have to set the transport before each message.
+		err := tx.CloseTx()
+		if err != nil {
+			tx.OnTxError(tx, err) // This SHOULD be defined! If it is not: bug.
+		}
+	}
+	rxtx.SetTxTransport(c.msg.mustTx())
 	// Ready to start sending packet now.
-	rxtx.SetTxTransport(&wcloser{Writer: c.msg.mustTx()})
+
 	varconn := c.varconnect()
 	// TODO: Add Connack SP logic.
 	_, err = c.mqc.Connect(&varconn)
@@ -91,7 +95,7 @@ func (c *Client) Connect() error {
 	return nil
 }
 
-func (c *Client) erraticDisconnect(err error) {
+func (c *Client) abnormalDisconnect(err error) {
 	if c.IsConnected() {
 		err := c.msg.ws.Close(websocket.StatusInternalError, "graceful disconnect")
 		if err != nil {
@@ -118,7 +122,7 @@ type messenger struct {
 	w  io.WriteCloser
 }
 
-func (msr *messenger) mustTx() io.Writer {
+func (msr *messenger) mustTx() io.WriteCloser {
 	w, err := msr.NewTx()
 	if err != nil || w == nil {
 		panic(err)
@@ -126,21 +130,13 @@ func (msr *messenger) mustTx() io.Writer {
 	return w
 }
 
-func (msr *messenger) NewTx() (io.Writer, error) {
+func (msr *messenger) NewTx() (io.WriteCloser, error) {
 	if msr.HasTx() {
 		return nil, errors.New("last message not yet sent")
 	}
 	w, err := msr.ws.Writer(context.Background(), websocket.MessageBinary)
 	msr.w = w
 	return w, err
-}
-
-func (msr *messenger) Send() error {
-	if !msr.HasTx() {
-		return errors.New("no message to send or last message errored")
-	}
-	defer func() { msr.w = nil }()
-	return msr.w.Close()
 }
 
 func (msr *messenger) HasTx() bool { return msr.w != nil }

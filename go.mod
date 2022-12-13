@@ -1,11 +1,9 @@
-module github.com/soypat/wsmqtt
+module github.com/soypat/natiu-wsocket
 
 go 1.19
 
-replace github.com/soypat/natiu-mqtt => ../natiu-mqtt
-
 require (
-	github.com/soypat/natiu-mqtt v0.0.0-20221212210843-650ed5092d48
+	github.com/soypat/natiu-mqtt v0.2.0
 	nhooyr.io/websocket v1.8.7
 )
 
