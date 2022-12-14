@@ -11,15 +11,19 @@ import (
 	"nhooyr.io/websocket"
 )
 
+var (
+	ErrNotConnected = errors.New("client not connected")
+)
+
 type Client struct {
-	mqc mqtt.Client
-	cfg ClientConfig
-	msg *messenger
+	mqc     mqtt.Client
+	cfg     ClientConfig
+	msg     *messenger
+	lastCtx context.Context
 }
 
 type ClientConfig struct {
 	// TODO(soypat): Add Will flags/fields?
-
 	URL string
 	// MQTT keepalive is amount of seconds between messages before server disconnects client automatically.
 	MQTTKeepAlive      uint16
@@ -38,13 +42,13 @@ func NewClient(clientID string, cfg ClientConfig) (*Client, error) {
 	return &c, nil
 }
 
-func (c *Client) Connect() error {
+func (c *Client) Connect(ctx context.Context) error {
 	// A large part of this function is websocket setup and callback setup.
 	// The actual packet sending happens after the configuration.
 	if c.IsConnected() {
 		return errors.New("already connected")
 	}
-	ctx := context.Background()
+	c.lastCtx = ctx
 	conn, resp, err := websocket.Dial(ctx, c.cfg.URL, c.cfg.WSOptions)
 	if err != nil {
 		var answer []byte
@@ -61,14 +65,8 @@ func (c *Client) Connect() error {
 	rxtx.OnRxError = func(r *mqtt.Rx, err error) {
 		c.abnormalDisconnect(err)
 	}
-	mt, rd, err := conn.Reader(ctx)
-	if err != nil {
-		return err
-	}
-	if mt != websocket.MessageBinary {
-		return errors.New("expected binary message protocol on websocket")
-	}
-	rxtx.SetRxTransport(io.NopCloser(rd))
+
+	rxtx.SetRxTransport(&clientReader{Client: c})
 
 	// Setup Tx.
 	rxtx.OnTxError = func(tx *mqtt.Tx, err error) {
@@ -82,6 +80,7 @@ func (c *Client) Connect() error {
 		if err != nil {
 			tx.OnTxError(tx, err) // This SHOULD be defined! If it is not: bug.
 		}
+		c.msg.w = nil
 	}
 	rxtx.SetTxTransport(c.msg.mustTx())
 	// Ready to start sending packet now.
@@ -95,7 +94,27 @@ func (c *Client) Connect() error {
 	return nil
 }
 
+func (c *Client) Ping(ctx context.Context) error {
+	if !c.IsConnected() {
+		return ErrNotConnected
+	}
+	c.lastCtx = ctx
+	rxtx := c.rxtx()
+	rxtx.SetTxTransport(c.msg.mustTx())
+	return c.mqc.Ping()
+}
+
+func (c *Client) Subscribe() error {
+	if !c.IsConnected() {
+		return ErrNotConnected
+	}
+	rxtx := c.rxtx()
+	rxtx.SetTxTransport(c.msg.mustTx())
+	return c.mqc.Ping()
+}
+
 func (c *Client) abnormalDisconnect(err error) {
+	log.Println("abnormal disconnect call:", err)
 	if c.IsConnected() {
 		err := c.msg.ws.Close(websocket.StatusInternalError, "graceful disconnect")
 		if err != nil {
@@ -141,16 +160,47 @@ func (msr *messenger) NewTx() (io.WriteCloser, error) {
 
 func (msr *messenger) HasTx() bool { return msr.w != nil }
 
-// wcloser implements WriterCloser interface from an io.Writer.
-// It calls f on Close and returns it's error. f can be nil in which case nil is returned by Close.
-type wcloser struct {
-	io.Writer
-	f func() error
+type clientReader struct {
+	*Client
+	buf []byte
 }
 
-func (wc *wcloser) Close() error {
-	if wc.f != nil {
-		return wc.f()
-	}
+func (cr *clientReader) Close() error {
+	cr.buf = nil
 	return nil
+}
+
+func (cr *clientReader) Read(p []byte) (int, error) {
+	if !cr.IsConnected() {
+		return 0, ErrNotConnected
+	}
+	if len(cr.buf) > 0 {
+		// Pre read of contents.
+		n := copy(p, cr.buf)
+		cr.buf = cr.buf[n:]
+		if len(cr.buf) == 0 {
+			cr.buf = nil
+		}
+		if n == len(p) {
+			return n, nil
+		}
+	}
+	mt, b, err := cr.msg.ws.Read(cr.lastCtx)
+	if err != nil || len(b) == 0 { // TODO(soypat): len(b)==0, this check OK?
+		return 0, err
+	}
+	if mt != websocket.MessageBinary {
+		return 0, errors.New("expected binary message")
+	}
+	if len(cr.buf) == 0 {
+		cr.buf = b
+	} else {
+		cr.buf = append(cr.buf, b...)
+	}
+	n := copy(p, cr.buf)
+	cr.buf = cr.buf[n:]
+	if len(cr.buf) == 0 {
+		cr.buf = nil
+	}
+	return n, nil
 }
