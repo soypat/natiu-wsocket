@@ -15,11 +15,13 @@ var (
 	ErrNotConnected = errors.New("client not connected")
 )
 
+// Client shall be safe to use concurrently between two goroutines, one reader (Rx) and
+// one that writes (Tx).
 type Client struct {
 	mqc       mqtt.Client
 	cfg       ClientConfig
 	msg       *messenger
-	lastCtx   context.Context
+	lastRxCtx context.Context
 	currentPI uint16
 }
 
@@ -57,7 +59,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	if c.IsConnected() {
 		return errors.New("already connected")
 	}
-	c.lastCtx = ctx
+	c.lastRxCtx = ctx
 	conn, resp, err := websocket.Dial(ctx, c.cfg.URL, c.cfg.WSOptions)
 	if err != nil {
 		var answer []byte
@@ -69,7 +71,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.msg = &messenger{
 		ws: *conn,
 	}
-	rxtx := c.rxtxHandle()
+	rxtx := c.rxtx()
 	// Setup Rx.
 	rxtx.OnRxError = func(r *mqtt.Rx, err error) {
 		c.abnormalDisconnect(err)
@@ -91,11 +93,14 @@ func (c *Client) Connect(ctx context.Context) error {
 		}
 		c.msg.w = nil
 	}
-	rxtx.SetTxTransport(c.msg.mustTx())
+	err = c.UnsafePrepareTx(ctx)
+	if err != nil {
+		return err
+	}
 	// Ready to start sending packet now.
-
 	varconn := c.varconnect()
 	// TODO: Add Connack SP logic.
+	c.lastRxCtx = ctx
 	_, err = c.mqc.Connect(&varconn)
 	if err != nil {
 		return err
@@ -107,9 +112,11 @@ func (c *Client) Ping(ctx context.Context) error {
 	if !c.IsConnected() {
 		return ErrNotConnected
 	}
-	c.lastCtx = ctx
-	rxtx := c.rxtxHandle()
-	rxtx.SetTxTransport(c.msg.mustTx())
+	err := c.UnsafePrepareTx(ctx)
+	if err != nil {
+		return err
+	}
+	c.lastRxCtx = ctx
 	return c.mqc.Ping()
 }
 
@@ -117,10 +124,11 @@ func (c *Client) Subscribe(ctx context.Context, subReq []mqtt.SubscribeRequest) 
 	if !c.IsConnected() {
 		return ErrNotConnected
 	}
-	c.lastCtx = ctx
-	rxtx := c.rxtxHandle()
-	rxtx.SetTxTransport(c.msg.mustTx())
-
+	err := c.UnsafePrepareTx(ctx)
+	if err != nil {
+		return err
+	}
+	c.lastRxCtx = ctx
 	suback, err := c.mqc.Subscribe(mqtt.VariablesSubscribe{
 		PacketIdentifier: c.newPI(),
 		TopicFilters:     subReq,
@@ -165,15 +173,37 @@ func (c *Client) PublishPayload(ctx context.Context, topic string, qos mqtt.QoSL
 	if err != nil {
 		return err
 	}
-	rxtx := c.rxtxHandle()
-	rxtx.SetTxTransport(c.msg.mustTx())
-	c.lastCtx = ctx
+	err = c.UnsafePrepareTx(ctx)
+	if err != nil {
+		return err
+	}
+	// c.lastRxCtx = ctx
 	err = c.mqc.PublishPayload(hdr, vp, payload)
 	if err != nil {
 		return err
 	}
 	return nil
 }
+
+// Prepare Tx must be called before sending a message over the RxTx
+// returned by UnsafeRxTx.
+func (c *Client) UnsafePrepareTx(ctx context.Context) error {
+	msg := c.msg // If msg is edited between here and NewTx no harm is done.
+	if !c.IsConnected() || msg == nil {
+		return ErrNotConnected
+	}
+	transport, err := msg.NewTx(ctx)
+	if err != nil {
+		return err
+	}
+	rxtx := c.rxtx()
+	rxtx.SetTxTransport(transport)
+	return nil
+}
+
+// UnsafeRxTx returns the underyling RxTx with callback handlers and all.
+// Not safe for concurrent use.
+func (c *Client) UnsafeRxTx() *mqtt.RxTx { return c.rxtx() }
 
 func (c *Client) abnormalDisconnect(err error) {
 	if c.IsConnected() {
@@ -188,14 +218,25 @@ func (c *Client) abnormalDisconnect(err error) {
 	}
 }
 
+// Disconnect performs a clean disconnect. If the clean disconnect fails it returns an error.
+// Even if the clean disconnect fails and Disconnect returns error the result of IsConnected
+// will always be false after a call to Disonnect.
 func (c *Client) Disconnect(ctx context.Context) error {
 	if !c.IsConnected() {
 		return nil
 	}
-	c.lastCtx = ctx
-	rxtx := c.rxtxHandle()
-	rxtx.SetTxTransport(c.msg.mustTx())
-	return c.mqc.Disconnect()
+	// c.lastRxCtx = ctx
+	err := c.UnsafePrepareTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { c.msg = nil }()
+	err = c.mqc.Disconnect()
+	if err != nil {
+		c.abnormalDisconnect(err)
+	}
+	c.msg = nil
+	return err
 }
 
 func (c *Client) IsConnected() bool { return c.msg != nil }
@@ -208,11 +249,7 @@ func (c *Client) varconnect() (varConn mqtt.VariablesConnect) {
 	return varConn
 }
 
-func (c *Client) NewRxTx() *mqtt.RxTx {
-	return c.mqc.RxTx()
-}
-
-func (c *Client) rxtxHandle() *mqtt.RxTx { return c.mqc.UnsafeRxTxPointer() }
+func (c *Client) rxtx() *mqtt.RxTx { return c.mqc.UnsafeRxTxPointer() }
 func (c *Client) newPI() uint16 {
 	pi := c.currentPI
 	c.currentPI++
@@ -224,24 +261,11 @@ type messenger struct {
 	w  io.WriteCloser
 }
 
-func (msr *messenger) mustTx() io.WriteCloser {
-	w, err := msr.NewTx()
-	if err != nil || w == nil {
-		// If you are hitting this panic you are probably trying
-		// to leverage concurrency- which is an incorrect use of this package.
-		// If you wish to use Client type concurrently please try to apply
-		// a worker queue pattern to send packets to avoid data races.
-		// If this is not the case please file a bug!
-		panic(err)
-	}
-	return w
-}
-
-func (msr *messenger) NewTx() (io.WriteCloser, error) {
+func (msr *messenger) NewTx(ctx context.Context) (io.WriteCloser, error) {
 	if msr.HasTx() {
 		return nil, errors.New("last message not yet sent")
 	}
-	w, err := msr.ws.Writer(context.Background(), websocket.MessageBinary)
+	w, err := msr.ws.Writer(ctx, websocket.MessageBinary)
 	msr.w = w
 	return w, err
 }
@@ -273,7 +297,7 @@ func (cr *clientReader) Read(p []byte) (n int, _ error) {
 			return n, nil
 		}
 	}
-	mt, b, err := cr.msg.ws.Read(cr.lastCtx)
+	mt, b, err := cr.msg.ws.Read(cr.lastRxCtx)
 	if err != nil { // TODO(soypat): len(b)==0, this check OK?
 		if errors.As(err, &websocket.CloseError{}) {
 			cr.abnormalDisconnect(err)

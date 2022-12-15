@@ -97,7 +97,7 @@ func loopbackLoop(mainCtx context.Context, c *wsocket.Client, topic string, ping
 	cancel := func() {}
 	lastSuccess := time.Now()
 	ctx := mainCtx
-	rxtx := c.NewRxTx()
+	rxtx := c.UnsafeRxTx()
 	for {
 		currentPayload := uint16(lastSuccess.UnixMilli())
 		// var currentPayload uint16 = 0x6446
