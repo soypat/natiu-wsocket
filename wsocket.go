@@ -16,10 +16,11 @@ var (
 )
 
 type Client struct {
-	mqc     mqtt.Client
-	cfg     ClientConfig
-	msg     *messenger
-	lastCtx context.Context
+	mqc       mqtt.Client
+	cfg       ClientConfig
+	msg       *messenger
+	lastCtx   context.Context
+	currentPI uint16
 }
 
 type ClientConfig struct {
@@ -29,15 +30,23 @@ type ClientConfig struct {
 	MQTTKeepAlive      uint16
 	Username, Password string
 	WSOptions          *websocket.DialOptions
+	Subs               mqtt.Subscriptions
 }
 
-func NewClient(clientID string, cfg ClientConfig) (*Client, error) {
+func NewClient(clientID string, config ClientConfig) (*Client, error) {
+	if config.Subs == nil {
+		return nil, errors.New("nil Sub field in config")
+	}
+	// Unsubscribe from all.
+	config.Subs.Unsubscribe("#", nil)
+
 	const bufsize = 8 * 1024
 	mqc := mqtt.NewClient(mqtt.DecoderNoAlloc{UserBuffer: make([]byte, bufsize)})
 	mqc.ID = clientID
 	c := Client{
-		mqc: *mqc,
-		cfg: cfg,
+		mqc:       *mqc,
+		cfg:       config,
+		currentPI: 1,
 	}
 	return &c, nil
 }
@@ -60,7 +69,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.msg = &messenger{
 		ws: *conn,
 	}
-	rxtx := c.rxtx()
+	rxtx := c.rxtxHandle()
 	// Setup Rx.
 	rxtx.OnRxError = func(r *mqtt.Rx, err error) {
 		c.abnormalDisconnect(err)
@@ -99,28 +108,83 @@ func (c *Client) Ping(ctx context.Context) error {
 		return ErrNotConnected
 	}
 	c.lastCtx = ctx
-	rxtx := c.rxtx()
+	rxtx := c.rxtxHandle()
 	rxtx.SetTxTransport(c.msg.mustTx())
 	return c.mqc.Ping()
 }
 
-func (c *Client) Subscribe() error {
+func (c *Client) Subscribe(ctx context.Context, subReq []mqtt.SubscribeRequest) error {
 	if !c.IsConnected() {
 		return ErrNotConnected
 	}
-	rxtx := c.rxtx()
+	c.lastCtx = ctx
+	rxtx := c.rxtxHandle()
 	rxtx.SetTxTransport(c.msg.mustTx())
-	return c.mqc.Ping()
+
+	suback, err := c.mqc.Subscribe(mqtt.VariablesSubscribe{
+		PacketIdentifier: c.newPI(),
+		TopicFilters:     subReq,
+	})
+	if err != nil {
+		return err
+	}
+
+	if len(subReq) != len(suback.ReturnCodes) {
+		return errors.New("length of SUBACK return codes does not match SUBSCRIBE requests")
+	}
+	if err := suback.Validate(); err != nil {
+		return err
+	}
+	for i, rc := range suback.ReturnCodes {
+		if rc.IsValid() {
+			err := c.cfg.Subs.Subscribe(subReq[i].TopicFilter)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Client) PublishPayload(ctx context.Context, topic string, qos mqtt.QoSLevel, payload []byte) error {
+	if !c.IsConnected() {
+		return ErrNotConnected
+	}
+	if qos != mqtt.QoS0 {
+		return errors.New("only QoS0 supported")
+	}
+	pflags, err := mqtt.NewPublishFlags(qos, false, false)
+	if err != nil {
+		return err
+	}
+	vp := mqtt.VariablesPublish{
+		TopicName:        []byte(topic),
+		PacketIdentifier: c.newPI(),
+	}
+	hdr, err := mqtt.NewHeader(mqtt.PacketPublish, pflags, uint32(vp.Size(qos)+len(payload)))
+	if err != nil {
+		return err
+	}
+	rxtx := c.rxtxHandle()
+	rxtx.SetTxTransport(c.msg.mustTx())
+	c.lastCtx = ctx
+	err = c.mqc.PublishPayload(hdr, vp, payload)
+	if err != nil {
+		return err
+	}
+	return nil
 }
 
 func (c *Client) abnormalDisconnect(err error) {
-	log.Println("abnormal disconnect call:", err)
 	if c.IsConnected() {
+		log.Println("abnormal disconnect call:", err)
 		err := c.msg.ws.Close(websocket.StatusInternalError, "graceful disconnect")
 		if err != nil {
 			log.Println("error during graceful disconnect:", err)
 		}
 		c.msg = nil
+	} else {
+		log.Println("abnormal disconnect call while connected:", err)
 	}
 }
 
@@ -134,7 +198,16 @@ func (c *Client) varconnect() (varConn mqtt.VariablesConnect) {
 	return varConn
 }
 
-func (c *Client) rxtx() *mqtt.RxTx { return c.mqc.UnsafeRxTxPointer() }
+func (c *Client) NewRxTx() *mqtt.RxTx {
+	return c.mqc.RxTx()
+}
+
+func (c *Client) rxtxHandle() *mqtt.RxTx { return c.mqc.UnsafeRxTxPointer() }
+func (c *Client) newPI() uint16 {
+	pi := c.currentPI
+	c.currentPI++
+	return pi
+}
 
 type messenger struct {
 	ws websocket.Conn
@@ -144,6 +217,11 @@ type messenger struct {
 func (msr *messenger) mustTx() io.WriteCloser {
 	w, err := msr.NewTx()
 	if err != nil || w == nil {
+		// If you are hitting this panic you are probably trying
+		// to leverage concurrency- which is an incorrect use of this package.
+		// If you wish to use Client type concurrently please try to apply
+		// a worker queue pattern to send packets to avoid data races.
+		// If this is not the case please file a bug!
 		panic(err)
 	}
 	return w
@@ -170,13 +248,13 @@ func (cr *clientReader) Close() error {
 	return nil
 }
 
-func (cr *clientReader) Read(p []byte) (int, error) {
+func (cr *clientReader) Read(p []byte) (n int, _ error) {
 	if !cr.IsConnected() {
 		return 0, ErrNotConnected
 	}
 	if len(cr.buf) > 0 {
 		// Pre read of contents.
-		n := copy(p, cr.buf)
+		n = copy(p, cr.buf)
 		cr.buf = cr.buf[n:]
 		if len(cr.buf) == 0 {
 			cr.buf = nil
@@ -186,8 +264,11 @@ func (cr *clientReader) Read(p []byte) (int, error) {
 		}
 	}
 	mt, b, err := cr.msg.ws.Read(cr.lastCtx)
-	if err != nil || len(b) == 0 { // TODO(soypat): len(b)==0, this check OK?
-		return 0, err
+	if err != nil { // TODO(soypat): len(b)==0, this check OK?
+		if errors.As(err, &websocket.CloseError{}) {
+			cr.abnormalDisconnect(err)
+		}
+		return n, err
 	}
 	if mt != websocket.MessageBinary {
 		return 0, errors.New("expected binary message")
@@ -197,7 +278,7 @@ func (cr *clientReader) Read(p []byte) (int, error) {
 	} else {
 		cr.buf = append(cr.buf, b...)
 	}
-	n := copy(p, cr.buf)
+	n += copy(p, cr.buf)
 	cr.buf = cr.buf[n:]
 	if len(cr.buf) == 0 {
 		cr.buf = nil
