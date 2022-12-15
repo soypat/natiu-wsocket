@@ -188,6 +188,16 @@ func (c *Client) abnormalDisconnect(err error) {
 	}
 }
 
+func (c *Client) Disconnect(ctx context.Context) error {
+	if !c.IsConnected() {
+		return nil
+	}
+	c.lastCtx = ctx
+	rxtx := c.rxtxHandle()
+	rxtx.SetTxTransport(c.msg.mustTx())
+	return c.mqc.Disconnect()
+}
+
 func (c *Client) IsConnected() bool { return c.msg != nil }
 
 func (c *Client) varconnect() (varConn mqtt.VariablesConnect) {
