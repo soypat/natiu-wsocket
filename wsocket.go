@@ -18,7 +18,7 @@ var (
 // Client shall be safe to use concurrently between two goroutines, one reader (Rx) and
 // one that writes (Tx).
 type Client struct {
-	mqc       mqtt.Client
+	mqc       *mqtt.Client
 	cfg       ClientConfig
 	msg       *messenger
 	lastRxCtx context.Context
@@ -46,7 +46,7 @@ func NewClient(clientID string, config ClientConfig) (*Client, error) {
 	mqc := mqtt.NewClient(mqtt.DecoderNoAlloc{UserBuffer: make([]byte, bufsize)})
 	mqc.ID = clientID
 	c := Client{
-		mqc:       *mqc,
+		mqc:       mqc,
 		cfg:       config,
 		currentPI: 1,
 	}
@@ -185,6 +185,26 @@ func (c *Client) PublishPayload(ctx context.Context, topic string, qos mqtt.QoSL
 	return nil
 }
 
+func (c *Client) ReadNextPacket(ctx context.Context) (int, error) {
+	if !c.IsConnected() {
+		return 0, ErrNotConnected
+	}
+	rxtx := c.rxtx()
+	c.lastRxCtx = ctx
+	return rxtx.ReadNextPacket()
+}
+
+func (c *Client) SetOnPublishCallback(f func(mqtt.Header, mqtt.VariablesPublish, io.Reader) error) {
+	if f == nil {
+		c.rxtx().OnPub = nil
+		return
+	}
+	c.rxtx().OnPub = func(rx *mqtt.Rx, varPub mqtt.VariablesPublish, r io.Reader) error {
+		h := rx.LastReceivedHeader
+		return f(h, varPub, r)
+	}
+}
+
 // Prepare Tx must be called before sending a message over the RxTx
 // returned by UnsafeRxTx.
 func (c *Client) UnsafePrepareTx(ctx context.Context) error {
@@ -210,12 +230,13 @@ func (c *Client) abnormalDisconnect(err error) {
 		log.Println("abnormal disconnect call:", err)
 		err := c.msg.ws.Close(websocket.StatusInternalError, "graceful disconnect")
 		if err != nil {
-			log.Println("error during graceful disconnect:", err)
+			log.Println("[CRIT] error during graceful disconnect:", err)
+			// panic(err)
 		}
-		c.msg = nil
 	} else {
 		log.Println("abnormal disconnect call while connected:", err)
 	}
+	c.msg = nil
 }
 
 // Disconnect performs a clean disconnect. If the clean disconnect fails it returns an error.
