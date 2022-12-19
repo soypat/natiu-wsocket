@@ -104,7 +104,7 @@ func loopbackLoop(mainCtx context.Context, c *wsocket.Client, topic string, ping
 		binary.BigEndian.PutUint16(payload, currentPayload)
 		time.Sleep(pingrate)
 		err := c.PublishPayload(ctx, topic, mqtt.QoS0, payload)
-		rxtx.OnPub = func(rx *mqtt.Rx, vp mqtt.VariablesPublish, r io.Reader) error {
+		rxtx.RxCallbacks.OnPub = func(rx *mqtt.Rx, vp mqtt.VariablesPublish, r io.Reader) error {
 			pl, err := io.ReadAll(r)
 			if err != nil {
 				return err

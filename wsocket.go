@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 
 	mqtt "github.com/soypat/natiu-mqtt"
 	"nhooyr.io/websocket"
@@ -69,30 +70,17 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("ws err:%w. Response if present: %q", err, answer)
 	}
 	c.msg = &messenger{
-		ws: *conn,
+		ws: conn,
 	}
 	rxtx := c.rxtx()
+	rxtx.RxCallbacks, rxtx.TxCallbacks = c.callbacks()
 	// Setup Rx.
-	rxtx.OnRxError = func(r *mqtt.Rx, err error) {
-		c.abnormalDisconnect(err)
-	}
-
 	rxtx.SetRxTransport(&clientReader{Client: c})
+	err = c.UnsafePrepareRx(ctx)
+	if err != nil {
+		return err
+	}
 
-	// Setup Tx.
-	rxtx.OnTxError = func(tx *mqtt.Tx, err error) {
-		c.abnormalDisconnect(err)
-	}
-	rxtx.OnSuccessfulTx = func(tx *mqtt.Tx) {
-		// Websocket Writers accumulate writes until Close is called.
-		// After Close called the writer flushes contents onto the network.
-		// This means we have to set the transport before each message.
-		err := tx.CloseTx()
-		if err != nil {
-			tx.OnTxError(tx, err) // This SHOULD be defined! If it is not: bug.
-		}
-		c.msg.w = nil
-	}
 	err = c.UnsafePrepareTx(ctx)
 	if err != nil {
 		return err
@@ -100,12 +88,42 @@ func (c *Client) Connect(ctx context.Context) error {
 	// Ready to start sending packet now.
 	varconn := c.varconnect()
 	// TODO: Add Connack SP logic.
-	c.lastRxCtx = ctx
 	_, err = c.mqc.Connect(&varconn)
 	if err != nil {
 		return err
 	}
 	return nil
+}
+
+func (c *Client) callbacks() (mqtt.RxCallbacks, mqtt.TxCallbacks) {
+	return mqtt.RxCallbacks{
+			OnRxError: func(r *mqtt.Rx, err error) {
+				c.abnormalDisconnect(err)
+			},
+			OnConnack: func(r *mqtt.Rx, vc mqtt.VariablesConnack) error {
+				if vc.ReturnCode != 0 {
+					return errors.New(vc.ReturnCode.String())
+				}
+				return nil
+			},
+		}, mqtt.TxCallbacks{
+			OnTxError: func(tx *mqtt.Tx, err error) {
+				c.abnormalDisconnect(err)
+			},
+			OnSuccessfulTx: func(tx *mqtt.Tx) {
+				// Websocket Writers accumulate writes until Close is called.
+				// After Close called the writer flushes contents onto the network.
+				// This means we have to set the transport before each message.
+				w := c.msg.w
+				if w != nil {
+					err := w.Close()
+					if err != nil {
+						log.Println("error during OnSuccessfulTx closing writer")
+					}
+				}
+				c.msg.w = nil
+			},
+		}
 }
 
 func (c *Client) Ping(ctx context.Context) error {
@@ -116,7 +134,10 @@ func (c *Client) Ping(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	c.lastRxCtx = ctx
+	err = c.UnsafePrepareRx(ctx)
+	if err != nil {
+		return err
+	}
 	return c.mqc.Ping()
 }
 
@@ -128,7 +149,10 @@ func (c *Client) Subscribe(ctx context.Context, subReq []mqtt.SubscribeRequest) 
 	if err != nil {
 		return err
 	}
-	c.lastRxCtx = ctx
+	err = c.UnsafePrepareRx(ctx)
+	if err != nil {
+		return err
+	}
 	suback, err := c.mqc.Subscribe(mqtt.VariablesSubscribe{
 		PacketIdentifier: c.newPI(),
 		TopicFilters:     subReq,
@@ -185,21 +209,45 @@ func (c *Client) PublishPayload(ctx context.Context, topic string, qos mqtt.QoSL
 	return nil
 }
 
+// Disconnect performs a clean disconnect. If the clean disconnect fails it returns an error.
+// Even if the clean disconnect fails and Disconnect returns error the result of IsConnected
+// will always be false after a call to Disonnect.
+func (c *Client) Disconnect(ctx context.Context) error {
+	if !c.IsConnected() {
+		return nil
+	}
+	// c.lastRxCtx = ctx
+	err := c.UnsafePrepareTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { c.msg = nil }()
+	err = c.mqc.Disconnect()
+	if err != nil {
+		c.abnormalDisconnect(fmt.Errorf("during Disconnect: %w", err))
+	}
+	c.msg = nil
+	return err
+}
+
 func (c *Client) ReadNextPacket(ctx context.Context) (int, error) {
 	if !c.IsConnected() {
 		return 0, ErrNotConnected
 	}
 	rxtx := c.rxtx()
-	c.lastRxCtx = ctx
+	err := c.UnsafePrepareRx(ctx)
+	if err != nil {
+		return 0, err
+	}
 	return rxtx.ReadNextPacket()
 }
 
 func (c *Client) SetOnPublishCallback(f func(mqtt.Header, mqtt.VariablesPublish, io.Reader) error) {
 	if f == nil {
-		c.rxtx().OnPub = nil
+		c.rxtx().RxCallbacks.OnPub = nil
 		return
 	}
-	c.rxtx().OnPub = func(rx *mqtt.Rx, varPub mqtt.VariablesPublish, r io.Reader) error {
+	c.rxtx().RxCallbacks.OnPub = func(rx *mqtt.Rx, varPub mqtt.VariablesPublish, r io.Reader) error {
 		h := rx.LastReceivedHeader
 		return f(h, varPub, r)
 	}
@@ -221,6 +269,17 @@ func (c *Client) UnsafePrepareTx(ctx context.Context) error {
 	return nil
 }
 
+// Prepare Tx must be called before sending a message over the RxTx
+// returned by UnsafeRxTx.
+func (c *Client) UnsafePrepareRx(ctx context.Context) error {
+	msg := c.msg // If msg is edited between here and NewTx no harm is done.
+	if !c.IsConnected() || msg == nil {
+		return ErrNotConnected
+	}
+	c.lastRxCtx = ctx
+	return nil
+}
+
 // UnsafeRxTx returns the underyling RxTx with callback handlers and all.
 // Not safe for concurrent use.
 func (c *Client) UnsafeRxTx() *mqtt.RxTx { return c.rxtx() }
@@ -237,27 +296,6 @@ func (c *Client) abnormalDisconnect(err error) {
 		log.Println("abnormal disconnect call while connected:", err)
 	}
 	c.msg = nil
-}
-
-// Disconnect performs a clean disconnect. If the clean disconnect fails it returns an error.
-// Even if the clean disconnect fails and Disconnect returns error the result of IsConnected
-// will always be false after a call to Disonnect.
-func (c *Client) Disconnect(ctx context.Context) error {
-	if !c.IsConnected() {
-		return nil
-	}
-	// c.lastRxCtx = ctx
-	err := c.UnsafePrepareTx(ctx)
-	if err != nil {
-		return err
-	}
-	defer func() { c.msg = nil }()
-	err = c.mqc.Disconnect()
-	if err != nil {
-		c.abnormalDisconnect(err)
-	}
-	c.msg = nil
-	return err
 }
 
 func (c *Client) IsConnected() bool { return c.msg != nil }
@@ -278,7 +316,7 @@ func (c *Client) newPI() uint16 {
 }
 
 type messenger struct {
-	ws websocket.Conn
+	ws *websocket.Conn
 	w  io.WriteCloser
 }
 
@@ -312,17 +350,24 @@ func (cr *clientReader) Read(p []byte) (n int, _ error) {
 		n = copy(p, cr.buf)
 		cr.buf = cr.buf[n:]
 		if len(cr.buf) == 0 {
-			cr.buf = nil
+			cr.buf = nil // Prevent memory leaks.
 		}
 		if n == len(p) {
 			return n, nil
 		}
 	}
+	if err := cr.lastRxCtx.Err(); err != nil {
+		return n, err
+	}
 	mt, b, err := cr.msg.ws.Read(cr.lastRxCtx)
-	if err != nil { // TODO(soypat): len(b)==0, this check OK?
-		if errors.As(err, &websocket.CloseError{}) {
+	if err != nil {
+		if strings.Contains(err.Error(), "WebSocket closed") {
 			cr.abnormalDisconnect(err)
 		}
+		// This code is not working as expected:
+		// if errors.As(err, &websocket.CloseError{}) {
+		// 	cr.abnormalDisconnect(err)
+		// }
 		return n, err
 	}
 	if mt != websocket.MessageBinary {
