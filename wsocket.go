@@ -54,6 +54,8 @@ func NewClient(clientID string, config ClientConfig) (*Client, error) {
 	return &c, nil
 }
 
+func (c *Client) LastPacketIDSent() uint16 { return c.currentPI - 1 }
+
 func (c *Client) Connect(ctx context.Context) error {
 	// A large part of this function is websocket setup and callback setup.
 	// The actual packet sending happens after the configuration.
@@ -286,12 +288,9 @@ func (c *Client) UnsafeRxTx() *mqtt.RxTx { return c.rxtx() }
 
 func (c *Client) abnormalDisconnect(err error) {
 	if c.IsConnected() {
-		log.Println("abnormal disconnect call:", err)
-		err := c.msg.ws.Close(websocket.StatusInternalError, "graceful disconnect")
-		if err != nil {
-			log.Println("[CRIT] error during graceful disconnect:", err)
-			// panic(err)
-		}
+		// log.Println("abnormal disconnect call:", err)
+		// TODO, should this error be handled? I think not.
+		_ = c.msg.ws.Close(websocket.StatusInternalError, "graceful disconnect")
 	} else {
 		log.Println("abnormal disconnect call while connected:", err)
 	}

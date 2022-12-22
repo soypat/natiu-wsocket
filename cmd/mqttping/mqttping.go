@@ -104,10 +104,14 @@ func loopbackLoop(mainCtx context.Context, c *wsocket.Client, topic string, ping
 		binary.BigEndian.PutUint16(payload, currentPayload)
 		time.Sleep(pingrate)
 		err := c.PublishPayload(ctx, topic, mqtt.QoS0, payload)
+		expectedPID := c.LastPacketIDSent()
 		rxtx.RxCallbacks.OnPub = func(rx *mqtt.Rx, vp mqtt.VariablesPublish, r io.Reader) error {
-			pl, err := io.ReadAll(r)
+			pl, err := io.ReadAll(r) // Empty reader.
 			if err != nil {
 				return err
+			}
+			if rx.LastReceivedHeader.Flags().QoS() != mqtt.QoS0 && vp.PacketIdentifier != expectedPID {
+				return fmt.Errorf("expected to receive packet identifier %v, got %v", expectedPID, vp.PacketIdentifier)
 			}
 			if len(pl) != 2 {
 				return fmt.Errorf("expected to receive payload %x, got length %d: %x(%q)", currentPayload, len(pl), pl, pl)
