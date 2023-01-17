@@ -4,6 +4,7 @@ go 1.19
 
 require (
 	github.com/soypat/natiu-mqtt v0.3.1
+	github.com/soypat/peasocket v0.0.0-20230115220831-a52d78cbcc2f
 	nhooyr.io/websocket v1.8.7
 )
 

@@ -40,6 +40,8 @@ github.com/modern-go/reflect2 v0.0.0-20180701023420-4b7aa43c6742/go.mod h1:bx2lN
 github.com/pmezard/go-difflib v1.0.0/go.mod h1:iKH77koFhYxTK1pcRnkKkqfTogsbg7gZNVY4sRDYZ/4=
 github.com/soypat/natiu-mqtt v0.3.1 h1:xSAkidn+IXmgwAGYmNGYLyJmvGQIvf11AwZTbyAJnM4=
 github.com/soypat/natiu-mqtt v0.3.1/go.mod h1:xEta+cwop9izVCW7xOx2W+ct9PRMqr0gNVkvBPnQTc4=
+github.com/soypat/peasocket v0.0.0-20230115220831-a52d78cbcc2f h1:6Zk+80zjFK+b+9J+qn9d7oyO3/zH32EC8PsjcLfTXYc=
+github.com/soypat/peasocket v0.0.0-20230115220831-a52d78cbcc2f/go.mod h1:cwgND4NXh6nTppyZaBeohTJMxs10/X2rkzYCdZAr1mM=
 github.com/stretchr/objx v0.1.0/go.mod h1:HFkY916IF+rwdDfMAkV7OtwuqBVzrE8GR6GFx+wExME=
 github.com/stretchr/testify v1.3.0/go.mod h1:M5WIy9Dh21IEIfnGCwXGc5bZfKNJtfHm1UVUgZn+9EI=
 github.com/stretchr/testify v1.4.0/go.mod h1:j7eGeouHqKxXV5pUuKE4zz7dFj8WfuZ+81PSLYec5m4=
